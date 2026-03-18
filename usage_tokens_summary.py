@@ -1,12 +1,31 @@
 #!/usr/bin/env python3
 """
 Process Cursor usage-events CSV and report total tokens used in the last 30 days.
+Also estimates cost if the same usage had gone through Anthropic's raw API
+(with prompt-cache pricing for cache reads).
 """
 
 import csv
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
+
+# Anthropic API $ per million tokens (input, cache_read, output). Cache = 90% off input.
+ANTHROPIC_PRICING = {
+    "opus": (5.00, 0.50, 25.00),   # Claude Opus 4.x
+    "sonnet": (3.00, 0.30, 15.00), # Claude Sonnet 4.x
+}
+
+
+def model_tier(model: str) -> str:
+    """Map CSV model name to pricing tier."""
+    m = (model or "").strip().lower()
+    if "opus" in m:
+        return "opus"
+    if "sonnet" in m or "composer" in m:
+        return "sonnet"
+    return "sonnet"  # default
 
 
 def parse_date(s: str) -> Optional[datetime]:
@@ -44,6 +63,8 @@ def main():
     output_tokens = 0
     cache_read = 0
     row_count = 0
+    # Per-tier token counts for Anthropic cost: (input_wo_cache, cache_read, output)
+    by_tier = defaultdict(lambda: {"input": 0, "cache": 0, "output": 0})
 
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -58,11 +79,22 @@ def main():
                 continue
 
             total_tokens += safe_int(row.get("Total Tokens", ""))
-            input_tokens += safe_int(row.get("Input (w/ Cache Write)", ""))
-            output_tokens += safe_int(row.get("Output Tokens", ""))
-            cache_read += safe_int(row.get("Cache Read", ""))
+            inp = safe_int(row.get("Input (w/ Cache Write)", ""))
+            inp_wo = safe_int(row.get("Input (w/o Cache Write)", ""))
+            cache = safe_int(row.get("Cache Read", ""))
+            out = safe_int(row.get("Output Tokens", ""))
+            input_tokens += inp
+            output_tokens += out
+            cache_read += cache
             row_count += 1
 
+            tier = model_tier(row.get("Model", ""))
+            by_tier[tier]["input"] += inp_wo
+            by_tier[tier]["cache"] += cache
+            by_tier[tier]["output"] += out
+
+    # Anthropic API cost estimate ($ per M tokens)
+    anthropic_total = 0.0
     print("Usage summary (last 30 days)")
     print("=" * 40)
     print(f"Events in range:     {row_count:,}")
@@ -70,6 +102,22 @@ def main():
     print(f"Output tokens:       {output_tokens:,}")
     print(f"Cache read:          {cache_read:,}")
     print(f"Total tokens:        {total_tokens:,}")
+    print()
+    print("Anthropic raw API cost estimate (with cache pricing)")
+    print("=" * 40)
+    for tier in sorted(by_tier.keys()):
+        t = by_tier[tier]
+        if t["input"] == 0 and t["cache"] == 0 and t["output"] == 0:
+            continue
+        inp_per_m, cache_per_m, out_per_m = ANTHROPIC_PRICING[tier]
+        cost_inp = (t["input"] / 1_000_000) * inp_per_m
+        cost_cache = (t["cache"] / 1_000_000) * cache_per_m
+        cost_out = (t["output"] / 1_000_000) * out_per_m
+        tier_total = cost_inp + cost_cache + cost_out
+        anthropic_total += tier_total
+        print(f"  {tier}: input ${cost_inp:.2f} + cache ${cost_cache:.2f} + output ${cost_out:.2f} = ${tier_total:.2f}")
+    print("-" * 40)
+    print(f"  Total (Anthropic API): ${anthropic_total:.2f}")
     return 0
 
 
